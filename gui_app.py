@@ -134,6 +134,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Operasyon kaydi ve geri alma icin durum
         self.active_motor: Optional[int] = None
+        self.selected_motors: set[int] = set()  # Çoklu motor seçimi için
         self.segment_start_ms = {1: None, 2: None, 3: None, 4: None}  # type: ignore
         self.segment_dir = {1: None, 2: None, 3: None, 4: None}       # 1=d, 2=a  # type: ignore
         self.reverse_actions: list[tuple[int, int, int]] = []  # (motor, inverse_dir, duration_ms)
@@ -165,13 +166,29 @@ class MainWindow(QtWidgets.QMainWindow):
         # Komut butonlari
         grid = QtWidgets.QGridLayout()
         row = 0
-        # Motor secim 1-5, adlar: 1=Kafa, 2=Sağ Sol, 3=Boyun, 4=Gövde, 5=Gripper
+        
+        # Motor seçimi için checkbox'lar ve butonlar
+        motor_selection_layout = QtWidgets.QHBoxLayout()
         motor_labels = ['Kafa', 'Sağ Sol', 'Boyun', 'Gövde', 'Gripper']
+        self.motor_checkboxes = {}
+        
         for idx, label in enumerate(motor_labels, start=1):
-            btn = QtWidgets.QPushButton(label)
-            btn.setToolTip(f"Motor {idx} - {label}")
-            btn.clicked.connect(lambda _=False, ch=str(idx): self.select_motor(int(ch)))
-            grid.addWidget(btn, row, idx - 1)
+            checkbox = QtWidgets.QCheckBox(f"M{idx}: {label}")
+            checkbox.setToolTip(f"Motor {idx} - {label}")
+            checkbox.stateChanged.connect(lambda state, motor=idx: self.toggle_motor_selection(motor, state))
+            self.motor_checkboxes[idx] = checkbox
+            motor_selection_layout.addWidget(checkbox)
+        
+        # Çoklu motor kontrol butonları
+        select_all_btn = QtWidgets.QPushButton('Hepsini Seç')
+        deselect_all_btn = QtWidgets.QPushButton('Hepsini Kaldır')
+        select_all_btn.clicked.connect(self.select_all_motors)
+        deselect_all_btn.clicked.connect(self.deselect_all_motors)
+        
+        motor_selection_layout.addWidget(select_all_btn)
+        motor_selection_layout.addWidget(deselect_all_btn)
+        
+        grid.addLayout(motor_selection_layout, row, 0, 1, 6)
         row += 1
 
         # Step ileri/geri/dur
@@ -297,7 +314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log.appendPlainText(text)
 
     def on_connected(self, port: str):
-        self.status_lbl.setText(f'Durum: Bağlı ({port})')
+        self.status_lbl.setText(f'Durum: Bağlı ({port}) - Motor Seçilmedi')
         self.log.appendPlainText(f"[INFO] Bağlandı: {port}\n")
 
     def on_disconnected(self):
@@ -398,6 +415,57 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self._append_operation('RESET')
 
+    # --- Çoklu Motor Seçimi Fonksiyonları ---
+    def toggle_motor_selection(self, motor: int, state: int):
+        """Motor seçimini toggle et"""
+        if state == 2:  # Qt.Checked
+            self.selected_motors.add(motor)
+            self._append_operation(f"MOTOR M{motor} SELECTED")
+        else:
+            self.selected_motors.discard(motor)
+            self._append_operation(f"MOTOR M{motor} DESELECTED")
+        
+        # UI güncellemesi
+        self.update_motor_status()
+
+    def select_all_motors(self):
+        """Tüm motorları seç"""
+        for motor in range(1, 6):
+            self.selected_motors.add(motor)
+            self.motor_checkboxes[motor].setChecked(True)
+        self._append_operation("ALL MOTORS SELECTED")
+        self.update_motor_status()
+
+    def deselect_all_motors(self):
+        """Tüm motor seçimlerini kaldır"""
+        for motor in range(1, 6):
+            self.selected_motors.discard(motor)
+            self.motor_checkboxes[motor].setChecked(False)
+        self._append_operation("ALL MOTORS DESELECTED")
+        self.update_motor_status()
+
+    def update_motor_status(self):
+        """Seçili motor durumunu UI'da göster"""
+        if self.selected_motors:
+            motors_str = ", ".join([f"M{m}" for m in sorted(self.selected_motors)])
+            self.status_lbl.setText(f'Durum: Bağlı - Seçili Motorlar: {motors_str}')
+        else:
+            self.status_lbl.setText('Durum: Bağlı - Motor Seçilmedi')
+
+    def send_to_selected_motors(self, command: str):
+        """Seçili tüm motorlara komut gönder"""
+        if not self.selected_motors:
+            self._append_operation("NO MOTORS SELECTED")
+            return
+        
+        for motor in sorted(self.selected_motors):
+            # Motor seçimi için önce motor numarasını gönder
+            self.send(str(motor))
+            # Sonra komutu gönder
+            self.send(command)
+            # Kısa bir bekleme
+            QtCore.QThread.msleep(10)
+
     # --- Motor/Servo handlers with logging & reverse ---
     def select_motor(self, motor: int):
         self.active_motor = motor
@@ -405,7 +473,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_operation(f"SELECT M{motor}")
 
     def handle_motion(self, code: str):
-        # Only for steppers 1..4
+        # Çoklu motor kontrolü aktifse
+        if self.selected_motors:
+            self.handle_multi_motor_motion(code)
+            return
+        
+        # Tek motor kontrolü (eski sistem)
         if not self.active_motor or self.active_motor not in (1, 2, 3, 4):
             return
         now = int(time.time() * 1000)
@@ -433,8 +506,59 @@ class MainWindow(QtWidgets.QMainWindow):
             self.segment_dir[motor] = None
             self.send('w')
 
+    def handle_multi_motor_motion(self, code: str):
+        """Çoklu motor için hareket kontrolü"""
+        now = int(time.time() * 1000)
+        stepper_motors = [m for m in self.selected_motors if m in (1, 2, 3, 4)]
+        
+        if not stepper_motors:
+            self._append_operation("NO STEPPER MOTORS SELECTED")
+            return
+
+        if code in ('d', 'a'):
+            # Tüm seçili stepper motorları için segment başlat
+            for motor in stepper_motors:
+                # Kapanmamis segment varsa kapat
+                if self.segment_start_ms[motor] is not None and self.segment_dir[motor] is not None:
+                    duration = now - int(self.segment_start_ms[motor])
+                    inv_dir = 2 if self.segment_dir[motor] == 1 else 1
+                    self.reverse_actions.append((motor, inv_dir, max(0, duration)))
+                    self._append_operation(f"M{motor} STOP duration={duration}ms")
+                
+                # Yeni segment baslat
+                self.segment_start_ms[motor] = now
+                self.segment_dir[motor] = 1 if code == 'd' else 2
+            
+            motors_str = ", ".join([f"M{m}" for m in stepper_motors])
+            self._append_operation(f"MULTI MOTOR START {motors_str} dir={'ILERI' if code=='d' else 'GERI'}")
+            
+            # Tüm motorlara komut gönder
+            self.send_to_selected_motors(code)
+            
+        elif code == 'w':
+            # Tüm seçili motorları durdur
+            for motor in stepper_motors:
+                if self.segment_start_ms[motor] is not None and self.segment_dir[motor] is not None:
+                    duration = now - int(self.segment_start_ms[motor])
+                    inv_dir = 2 if self.segment_dir[motor] == 1 else 1
+                    self.reverse_actions.append((motor, inv_dir, max(0, duration)))
+                    self._append_operation(f"M{motor} STOP duration={duration}ms")
+                self.segment_start_ms[motor] = None
+                self.segment_dir[motor] = None
+            
+            motors_str = ", ".join([f"M{m}" for m in stepper_motors])
+            self._append_operation(f"MULTI MOTOR STOP {motors_str}")
+            
+            # Tüm motorlara dur komutu gönder
+            self.send_to_selected_motors('w')
+
     def handle_servo(self, code: str):
-        # Only when motor 5 selected
+        # Çoklu motor kontrolü aktifse
+        if self.selected_motors:
+            self.handle_multi_motor_servo(code)
+            return
+        
+        # Tek motor kontrolü (eski sistem)
         if self.active_motor != 5:
             return
         if code == 'c':
@@ -450,7 +574,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self._append_operation(f"SERVO angle~{self.servo_angle_local}")
         self.send(code)
 
+    def handle_multi_motor_servo(self, code: str):
+        """Çoklu motor için servo kontrolü"""
+        servo_motors = [m for m in self.selected_motors if m == 5]
+        
+        if not servo_motors:
+            self._append_operation("NO SERVO MOTOR SELECTED")
+            return
+        
+        # Servo açısını güncelle
+        if code == 'c':
+            self.servo_angle_local = 0
+        elif code == '[':
+            self.servo_angle_local = min(180, self.servo_angle_local + 15)
+        elif code == ']':
+            self.servo_angle_local = max(0, self.servo_angle_local - 15)
+        elif code == 'd':
+            self.servo_angle_local = min(180, self.servo_angle_local + 60)
+        elif code == 'a':
+            self.servo_angle_local = max(0, self.servo_angle_local - 60)
+        
+        self._append_operation(f"MULTI SERVO angle~{self.servo_angle_local}")
+        
+        # Servo komutunu gönder
+        self.send_to_selected_motors(code)
+
     def return_to_home(self):
+        # Çoklu motor kontrolü aktifse
+        if self.selected_motors:
+            self.return_to_home_multi()
+            return
+        
+        # Tek motor kontrolü (eski sistem)
         # Servo -> 0 derece
         if self.active_motor != 5:
             self.select_motor(5)
@@ -466,6 +621,30 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.QThread.msleep(max(0, duration))
             self.send('w')
         self._append_operation('HOME DONE')
+        # Temizle
+        self.reverse_actions.clear()
+
+    def return_to_home_multi(self):
+        """Çoklu motor için home'a dönüş"""
+        # Servo motorları varsa 0'a getir
+        if 5 in self.selected_motors:
+            self.send('5')  # Motor 5'i seç
+            self.send('c')  # Servo'yu 0'a getir
+            self._append_operation('MULTI SERVO -> 0')
+
+        # Stepper motorları için ters hareket
+        stepper_motors = [m for m in self.selected_motors if m in (1, 2, 3, 4)]
+        if stepper_motors:
+            # Ters hareketleri oynat
+            for motor, inv_dir, duration in reversed(self.reverse_actions):
+                if motor in stepper_motors:
+                    self.send(str(motor))  # Motor seç
+                    self.send('d' if inv_dir == 1 else 'a')  # Ters yönde hareket
+                    QtWidgets.QApplication.processEvents()
+                    QtCore.QThread.msleep(max(0, duration))
+                    self.send('w')  # Dur
+        
+        self._append_operation('MULTI HOME DONE')
         # Temizle
         self.reverse_actions.clear()
 
