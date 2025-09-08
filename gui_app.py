@@ -127,7 +127,7 @@ class MainWindow(QtWidgets.QMainWindow):
         speed_bar = QtWidgets.QHBoxLayout()
         self.lbl_speed_title = QtWidgets.QLabel('Hız (µs):')
         self.slider_speed = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.slider_speed.setMinimum(400)
+        self.slider_speed.setMinimum(150)
         self.slider_speed.setMaximum(4000)
         self.slider_speed.setSingleStep(10)
         self.slider_speed.setPageStep(50)

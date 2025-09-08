@@ -16,7 +16,7 @@ HELP_TEXT = (
     "  R/T : kayit baslat/durdur\n"
     "  P/S : oynat baslat/durdur\n"
     "  L   : loop toggle\n"
-    "  Z#### : step hızı (µs), örn: Z0400 .. Z4000\n"
+    "  Z#### : step hızı (µs), örn: Z0150 .. Z4000\n"
     "  V   : bilgi\n"
     "  h   : yardim\n"
     "  q   : cikis\n"
