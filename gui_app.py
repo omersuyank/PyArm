@@ -90,42 +90,6 @@ class SerialWorker(QtCore.QThread):
         self._ser = None
 
 
-class PlaybackWorker(QtCore.QThread):
-    finished_ok = QtCore.pyqtSignal()
-    stopped = QtCore.pyqtSignal()
-
-    def __init__(self, events: list[tuple[int, str]], sender, loop: bool = False, parent=None):
-        super().__init__(parent)
-        self.events = sorted(events, key=lambda e: e[0])
-        self.sender = sender  # callable: send_char
-        self.loop = loop
-        self._stop = False
-
-    def stop(self):
-        self._stop = True
-
-    def run(self):
-        if not self.events:
-            self.finished_ok.emit()
-            return
-        while not self._stop:
-            start = int(time.time() * 1000)
-            for t_rel, ch in self.events:
-                if self._stop:
-                    self.stopped.emit()
-                    return
-                now = int(time.time() * 1000)
-                wait_ms = max(0, t_rel - (now - start))
-                QtCore.QThread.msleep(wait_ms)
-                try:
-                    self.sender(ch)
-                except Exception:
-                    pass
-            if not self.loop:
-                break
-        self.finished_ok.emit()
-
-
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -135,17 +99,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Operasyon kaydi ve geri alma icin durum
         self.active_motor: Optional[int] = None
         self.selected_motors: set[int] = set()  # Çoklu motor seçimi için
-        self.segment_start_ms = {1: None, 2: None, 3: None, 4: None}  # type: ignore
-        self.segment_dir = {1: None, 2: None, 3: None, 4: None}       # 1=d, 2=a  # type: ignore
+        self.segment_start_ms = {1: None, 2: None, 3: None, 4: None, 5: None}  # type: ignore
+        self.segment_dir = {1: None, 2: None, 3: None, 4: None, 5: None}       # 1=d, 2=a  # type: ignore
         self.reverse_actions: list[tuple[int, int, int]] = []  # (motor, inverse_dir, duration_ms)
         self.servo_angle_local: int = 0  # 0..180, baslangic 0
         self.ops_file = 'operations.txt'
 
-        # Yerel (PC) kayit/oynatma
-        self.local_events: list[tuple[int, str]] = []  # (t_ms_since_start, command_char)
-        self.local_rec_start_ms: Optional[int] = None
-        self.is_local_recording: bool = False
-        self.playback_thread: Optional[PlaybackWorker] = None
+        # Arduino kayıt/oynatma sistemi kullanılıyor
 
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
@@ -163,13 +123,28 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.status_lbl)
         layout.addLayout(top_bar)
 
+        # Hız kontrolü (stepDelay µs)
+        speed_bar = QtWidgets.QHBoxLayout()
+        self.lbl_speed_title = QtWidgets.QLabel('Hız (µs):')
+        self.slider_speed = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_speed.setMinimum(400)
+        self.slider_speed.setMaximum(4000)
+        self.slider_speed.setSingleStep(10)
+        self.slider_speed.setPageStep(50)
+        self.slider_speed.setValue(3000)
+        self.lbl_speed_value = QtWidgets.QLabel('3000')
+        speed_bar.addWidget(self.lbl_speed_title)
+        speed_bar.addWidget(self.slider_speed)
+        speed_bar.addWidget(self.lbl_speed_value)
+        layout.addLayout(speed_bar)
+
         # Komut butonlari
         grid = QtWidgets.QGridLayout()
         row = 0
         
         # Motor seçimi için checkbox'lar ve butonlar
         motor_selection_layout = QtWidgets.QHBoxLayout()
-        motor_labels = ['Kafa', 'Sağ Sol', 'Boyun', 'Gövde', 'Gripper']
+        motor_labels = ['Kafa', 'Kafa Sağ Sol', 'Boyun', 'Gövde', 'SağSol', 'Gripper']
         self.motor_checkboxes = {}
         
         for idx, label in enumerate(motor_labels, start=1):
@@ -271,6 +246,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # UI baglantilari
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.connect_btn.clicked.connect(self.manual_connect)
+        # Hız kontrolü sinyalleri
+        self.slider_speed.valueChanged.connect(self._on_speed_value_changed)
+        self.slider_speed.sliderReleased.connect(self._send_speed_to_arduino)
 
         self.refresh_ports()
         # Otomatik baglanma kaldirildi: kullanici secip baglanacak
@@ -310,6 +288,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.connect_to_port(str(device))
 
     def on_serial_line(self, text: str):
+        # Arduino'dan gelen mesajları analiz et ve UI'yi güncelle
+        text_lower = text.lower()
+        
+        # Kayıt durumu güncellemeleri
+        if '[rec] kayit basladi' in text_lower:
+            self.lbl_rec.setText('Kayıt: Açık')
+        elif '[rec] kayit durdu' in text_lower:
+            self.lbl_rec.setText('Kayıt: Kapalı')
+        elif '[play] oynatma basladi' in text_lower:
+            self.lbl_play.setText('Oynatma: Açık')
+        elif '[play] oynatma durdu' in text_lower:
+            self.lbl_play.setText('Oynatma: Kapalı')
+        elif 'loop:' in text_lower and 'acik' in text_lower:
+            self.lbl_loop.setText('Loop: Açık')
+        elif 'loop:' in text_lower and 'kapali' in text_lower:
+            self.lbl_loop.setText('Loop: Kapalı')
+        
         # Basit ve guvenli: dogrudan ekle
         self.log.appendPlainText(text)
 
@@ -325,70 +320,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.send_char(ch)
         # Genel log
         self._append_operation(f"SEND {ch}")
-        # Yerel kayit aktifse komutu zamanla birlikte ekle
-        if self.is_local_recording:
-            now = int(time.time() * 1000)
-            if self.local_rec_start_ms is None:
-                self.local_rec_start_ms = now
-            t_rel = now - int(self.local_rec_start_ms)
-            self.local_events.append((t_rel, ch))
+
+    # --- Speed control helpers ---
+    def _on_speed_value_changed(self, val: int):
+        self.lbl_speed_value.setText(str(val))
+
+    def _send_speed_to_arduino(self):
+        val = self.slider_speed.value()
+        # Protokol: 'Z' + 4 haneli mikro-saniye (örn: Z1800)
+        cmd = f"Z{val:04d}"
+        for ch in cmd:
+            self.send(ch)
 
     def _rec_play_action(self, code: str):
-        # UI uzerinden R/T/P/S/L/V gonderimi yerine yerel kayit/oynatma uygula
+        # Arduino'nun kayıt/oynatma sistemini kullan
         if code == 'R':
-            self._local_record_start()
+            self.send('R')  # Arduino'ya kayıt başlat komutu gönder
             self.lbl_rec.setText('Kayıt: Açık')
+            self._append_operation('ARDUINO REC START')
             return
         if code == 'T':
-            self._local_record_stop()
+            self.send('T')  # Arduino'ya kayıt durdur komutu gönder
             self.lbl_rec.setText('Kayıt: Kapalı')
+            self._append_operation('ARDUINO REC STOP')
             return
         if code == 'P':
-            self._local_play_start()
+            self.send('P')  # Arduino'ya oynatma başlat komutu gönder
             self.lbl_play.setText('Oynatma: Açık')
+            self._append_operation('ARDUINO PLAY START')
             return
         if code == 'S':
-            self._local_play_stop()
+            self.send('S')  # Arduino'ya oynatma durdur komutu gönder
             self.lbl_play.setText('Oynatma: Kapalı')
+            self._append_operation('ARDUINO PLAY STOP')
             return
         if code == 'L':
-            # basit toggle: mevcut yazidan anla
-            is_on = 'Açık' in self.lbl_loop.text()
-            self.lbl_loop.setText('Loop: Kapalı' if is_on else 'Loop: Açık')
+            self.send('L')  # Arduino'ya loop toggle komutu gönder
+            self._append_operation('ARDUINO LOOP TOGGLE')
             return
         if code == 'V':
-            # Arduino bilgisini gondermek istersen yine yolla
-            self.send('V')
+            self.send('V')  # Arduino'dan bilgi al
+            self._append_operation('ARDUINO INFO REQUEST')
             return
 
-    # --- Local record/play implementation ---
-    def _local_record_start(self):
-        self.local_events.clear()
-        self.local_rec_start_ms = None
-        self.is_local_recording = True
-        self._append_operation('LOCAL REC START')
-
-    def _local_record_stop(self):
-        self.is_local_recording = False
-        self._append_operation(f'LOCAL REC STOP (events={len(self.local_events)})')
-
-    def _local_play_start(self):
-        # Zaten calisiyorsa once durdur
-        self._local_play_stop()
-        if not self.local_events:
-            self._append_operation('LOCAL PLAY: no events')
-            return
-        self.playback_thread = PlaybackWorker(self.local_events, self.worker.send_char, loop=('Açık' in self.lbl_loop.text()))
-        self.playback_thread.finished_ok.connect(lambda: self._append_operation('LOCAL PLAY DONE'))
-        self.playback_thread.stopped.connect(lambda: self._append_operation('LOCAL PLAY STOPPED'))
-        self.playback_thread.start()
-        self._append_operation('LOCAL PLAY START')
-
-    def _local_play_stop(self):
-        if self.playback_thread and self.playback_thread.isRunning():
-            self.playback_thread.stop()
-            self.playback_thread.wait(1000)
-        self.playback_thread = None
+    # --- Arduino kayıt/oynatma sistemi kullanılıyor ---
 
 
     # --- Operation logging helpers ---
@@ -430,7 +405,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def select_all_motors(self):
         """Tüm motorları seç"""
-        for motor in range(1, 6):
+        for motor in range(1, 7):  # 1-6 arası motorlar
             self.selected_motors.add(motor)
             self.motor_checkboxes[motor].setChecked(True)
         self._append_operation("ALL MOTORS SELECTED")
@@ -438,7 +413,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def deselect_all_motors(self):
         """Tüm motor seçimlerini kaldır"""
-        for motor in range(1, 6):
+        for motor in range(1, 7):  # 1-6 arası motorlar
             self.selected_motors.discard(motor)
             self.motor_checkboxes[motor].setChecked(False)
         self._append_operation("ALL MOTORS DESELECTED")
@@ -458,13 +433,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_operation("NO MOTORS SELECTED")
             return
         
+        # Arduino'da motorlar aynı anda çalışabilir, bu yüzden hızlıca gönder
         for motor in sorted(self.selected_motors):
             # Motor seçimi için önce motor numarasını gönder
             self.send(str(motor))
             # Sonra komutu gönder
             self.send(command)
-            # Kısa bir bekleme
-            QtCore.QThread.msleep(10)
+            # Çok kısa bekleme - Arduino'nun komutu işlemesi için
+            QtCore.QThread.msleep(5)
 
     # --- Motor/Servo handlers with logging & reverse ---
     def select_motor(self, motor: int):
@@ -479,7 +455,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Tek motor kontrolü (eski sistem)
-        if not self.active_motor or self.active_motor not in (1, 2, 3, 4):
+        if not self.active_motor or self.active_motor not in (1, 2, 3, 4, 5):
             return
         now = int(time.time() * 1000)
         motor = self.active_motor
@@ -509,7 +485,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def handle_multi_motor_motion(self, code: str):
         """Çoklu motor için hareket kontrolü"""
         now = int(time.time() * 1000)
-        stepper_motors = [m for m in self.selected_motors if m in (1, 2, 3, 4)]
+        stepper_motors = [m for m in self.selected_motors if m in (1, 2, 3, 4, 5)]
         
         if not stepper_motors:
             self._append_operation("NO STEPPER MOTORS SELECTED")
@@ -559,7 +535,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Tek motor kontrolü (eski sistem)
-        if self.active_motor != 5:
+        if self.active_motor != 6:
             return
         if code == 'c':
             self.servo_angle_local = 0
@@ -576,7 +552,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def handle_multi_motor_servo(self, code: str):
         """Çoklu motor için servo kontrolü"""
-        servo_motors = [m for m in self.selected_motors if m == 5]
+        servo_motors = [m for m in self.selected_motors if m == 6]
         
         if not servo_motors:
             self._append_operation("NO SERVO MOTOR SELECTED")
@@ -607,8 +583,8 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Tek motor kontrolü (eski sistem)
         # Servo -> 0 derece
-        if self.active_motor != 5:
-            self.select_motor(5)
+        if self.active_motor != 6:
+            self.select_motor(6)
         self.send('c')  # absolute 0°
         self._append_operation('SERVO -> 0')
 
@@ -627,13 +603,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def return_to_home_multi(self):
         """Çoklu motor için home'a dönüş"""
         # Servo motorları varsa 0'a getir
-        if 5 in self.selected_motors:
-            self.send('5')  # Motor 5'i seç
+        if 6 in self.selected_motors:
+            self.send('6')  # Motor 6'yı seç
             self.send('c')  # Servo'yu 0'a getir
             self._append_operation('MULTI SERVO -> 0')
 
         # Stepper motorları için ters hareket
-        stepper_motors = [m for m in self.selected_motors if m in (1, 2, 3, 4)]
+        stepper_motors = [m for m in self.selected_motors if m in (1, 2, 3, 4, 5)]
         if stepper_motors:
             # Ters hareketleri oynat
             for motor, inv_dir, duration in reversed(self.reverse_actions):

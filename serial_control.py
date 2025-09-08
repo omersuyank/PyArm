@@ -6,7 +6,7 @@ from typing import Any
 
 HELP_TEXT = (
     "\nKomutlar (Arduino ile birebir):\n"
-    "  1-5 : motor secimi\n"
+    "  1-6 : motor secimi (1-5 step motor, 6 servo)\n"
     "  d   : ileri (step) / +60° (servo)\n"
     "  a   : geri (step)  / -60° (servo)\n"
     "  w   : dur (step)   / bekle (servo)\n"
@@ -16,9 +16,13 @@ HELP_TEXT = (
     "  R/T : kayit baslat/durdur\n"
     "  P/S : oynat baslat/durdur\n"
     "  L   : loop toggle\n"
+    "  Z#### : step hızı (µs), örn: Z0400 .. Z4000\n"
     "  V   : bilgi\n"
     "  h   : yardim\n"
     "  q   : cikis\n"
+    "\nÇoklu Motor Kontrolü:\n"
+    "  Birden fazla motor seçip aynı anda kontrol edebilirsiniz.\n"
+    "  Arduino kodunda motorlar aynı anda çalışabilir.\n"
 )
 
 
